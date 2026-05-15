@@ -1,0 +1,12 @@
+services:
+  log-analyzer:
+    build: .
+    container_name: local-log-analyzer
+    working_dir: /app
+    volumes:
+      - ./input:/data/input
+      - ./output:/data/output
+      - ./work:/data/work
+    environment:
+      - TZ=Asia/Dhaka
+    command: ["python", "analyze.py", "auto"]
