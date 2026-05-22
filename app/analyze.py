@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import os
 import re
 import shutil
@@ -68,6 +69,20 @@ class Job:
     out_path: Path
 
 
+@dataclass
+class Finding:
+    area: str
+    severity: str
+    issue: str
+    evidence: str
+    likely_cause: str
+    action: str
+
+
+SEVERITY_ORDER = {"LOW": 1, "MODERATE": 2, "HIGH": 3, "CRITICAL": 4}
+SEVERITY_SCORE = {"LOW": 10, "MODERATE": 20, "HIGH": 35, "CRITICAL": 50}
+
+
 def ensure_dirs() -> None:
     for p in [NGINX_DIR, LARAVEL_DIR, OUTPUT_ROOT, WORK_ROOT]:
         p.mkdir(parents=True, exist_ok=True)
@@ -118,6 +133,134 @@ def read_lines(path: Path) -> Iterable[str]:
 def write_markdown(out_path: Path, filename: str, content: str) -> None:
     out_path.mkdir(parents=True, exist_ok=True)
     (out_path / filename).write_text(content, encoding="utf-8")
+
+
+def write_json(out_path: Path, filename: str, payload: dict) -> None:
+    out_path.mkdir(parents=True, exist_ok=True)
+    (out_path / filename).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def percent(part: int, whole: int) -> float:
+    if whole <= 0:
+        return 0.0
+    return round((part / whole) * 100.0, 2)
+
+
+def worst_severity(findings: list[Finding]) -> str:
+    if not findings:
+        return "LOW"
+    return max(findings, key=lambda f: SEVERITY_ORDER.get(f.severity, 0)).severity
+
+
+def risk_score(findings: list[Finding]) -> int:
+    return min(100, sum(SEVERITY_SCORE.get(f.severity, 0) for f in findings))
+
+
+def decision_label(overall_severity: str) -> str:
+    if overall_severity in {"CRITICAL", "HIGH"}:
+        return "Action Required"
+    if overall_severity == "MODERATE":
+        return "Monitor Closely"
+    return "Healthy"
+
+
+def confidence_label(sample_size: int) -> str:
+    if sample_size >= 10000:
+        return "High"
+    if sample_size >= 1000:
+        return "Medium"
+    return "Low"
+
+
+def finding_to_dict(finding: Finding) -> dict:
+    return {
+        "area": finding.area,
+        "severity": finding.severity,
+        "issue": finding.issue,
+        "evidence": finding.evidence,
+        "likely_cause": finding.likely_cause,
+        "action": finding.action,
+    }
+
+
+def write_decision_outputs(
+    out_path: Path,
+    system_name: str,
+    zip_path: Path,
+    scanned_lines: int,
+    parsed_entries: int,
+    findings: list[Finding],
+    key_metrics: dict[str, str],
+) -> None:
+    sorted_findings = sorted(findings, key=lambda f: SEVERITY_ORDER.get(f.severity, 0), reverse=True)
+    overall = worst_severity(sorted_findings)
+    score = risk_score(sorted_findings)
+    decision = decision_label(overall)
+    confidence = confidence_label(parsed_entries)
+
+    if not sorted_findings:
+        summary = "No major issue signatures were detected from the parsed logs."
+    else:
+        summary = "; ".join(f"{f.area}: {f.issue}" for f in sorted_findings[:3])
+
+    payload = {
+        "generated_at_utc": datetime.utcnow().isoformat(),
+        "system": system_name,
+        "input_zip": str(zip_path),
+        "scanned_lines": scanned_lines,
+        "parsed_entries": parsed_entries,
+        "decision": decision,
+        "overall_severity": overall,
+        "risk_score": score,
+        "confidence": confidence,
+        "summary": summary,
+        "key_metrics": key_metrics,
+        "findings": [finding_to_dict(f) for f in sorted_findings],
+    }
+    write_json(out_path, "decision.json", payload)
+
+    findings_md = ""
+    if sorted_findings:
+        for idx, f in enumerate(sorted_findings, start=1):
+            findings_md += (
+                f"### Finding {idx}: {f.issue}\n\n"
+                f"- Area: `{f.area}`\n"
+                f"- Severity: `{f.severity}`\n"
+                f"- Evidence: {f.evidence}\n"
+                f"- Likely cause: {f.likely_cause}\n"
+                f"- Recommended action: {f.action}\n\n"
+            )
+    else:
+        findings_md = "No high-signal risks were detected from available logs.\n\n"
+
+    metrics_md = "\n".join(f"- {k}: `{v}`" for k, v in key_metrics.items())
+
+    md = f"""# {system_name} Decision Report
+
+## Executive Decision
+
+- Decision: `{decision}`
+- Overall severity: `{overall}`
+- Risk score (0-100): `{score}`
+- Confidence: `{confidence}`
+
+## Decision Summary
+
+{summary}
+
+## Key Metrics
+
+{metrics_md}
+
+## Findings
+
+{findings_md}## Notes for Senior Review
+
+- Use `decision.json` for automation/alerting.
+- Use this report with `report.md` and CSV files to validate remediation priority.
+- Confidence reflects parsed sample size; low confidence means collect more logs before final sign-off.
+"""
+    write_markdown(out_path, "decision.md", md)
 
 
 def save_bar_chart(series: pd.Series, title: str, xlabel: str, ylabel: str, out_file: Path) -> None:
@@ -182,6 +325,24 @@ def analyze_nginx(zip_path: Path, out_path: Path) -> None:
                 error_lines.append({"file": str(file.relative_to(work)), "line": line[:1000]})
 
     if not rows and not error_lines:
+        write_decision_outputs(
+            out_path=out_path,
+            system_name="Nginx",
+            zip_path=zip_path,
+            scanned_lines=total_lines,
+            parsed_entries=0,
+            findings=[
+                Finding(
+                    area="Observability",
+                    severity="MODERATE",
+                    issue="No parseable Nginx access/error entries found",
+                    evidence="0 parsed access rows and no sampled error lines",
+                    likely_cause="Unexpected log format, wrong files in ZIP, or empty logs",
+                    action="Validate ZIP contents and log format; rerun with complete access/error logs",
+                )
+            ],
+            key_metrics={"Total scanned lines": str(total_lines), "Parsed access rows": "0"},
+        )
         write_markdown(
             out_path,
             "report.md",
@@ -224,6 +385,122 @@ def analyze_nginx(zip_path: Path, out_path: Path) -> None:
     if error_lines:
         pd.DataFrame(error_lines).to_csv(out_path / "nginx_error_lines_sample.csv", index=False)
 
+    total_requests = len(df)
+    total_4xx_5xx = int((df["status"] >= 400).sum()) if not df.empty else 0
+    total_5xx = int((df["status"] >= 500).sum()) if not df.empty else 0
+    suspicious_count = int(df["is_suspicious"].sum()) if not df.empty else 0
+    bot_count = int(df["is_bot"].sum()) if not df.empty else 0
+    parse_coverage = percent(total_requests, total_lines)
+    server_error_rate = percent(total_5xx, total_requests)
+    total_error_rate = percent(total_4xx_5xx, total_requests)
+    suspicious_rate = percent(suspicious_count, total_requests)
+    bot_rate = percent(bot_count, total_requests)
+
+    findings: list[Finding] = []
+
+    if total_5xx >= 20 or server_error_rate >= 3.0:
+        sev = "CRITICAL" if server_error_rate >= 5.0 else "HIGH"
+        top_5xx_paths = (
+            df[df["status"] >= 500]["path"].value_counts().head(5).to_dict() if not df.empty else {}
+        )
+        findings.append(
+            Finding(
+                area="Availability",
+                severity=sev,
+                issue="Elevated server-side failures (5xx)",
+                evidence=f"{total_5xx}/{total_requests} requests are 5xx ({server_error_rate}%)",
+                likely_cause=f"Application/runtime instability on paths: {top_5xx_paths or 'n/a'}",
+                action="Treat as P0/P1 incident: inspect upstream app errors, DB connectivity, and dependency health",
+            )
+        )
+
+    if total_4xx_5xx >= 50 or total_error_rate >= 10.0:
+        sev = "HIGH" if total_error_rate >= 20.0 else "MODERATE"
+        findings.append(
+            Finding(
+                area="Reliability",
+                severity=sev,
+                issue="High request friction from 4xx/5xx responses",
+                evidence=f"{total_4xx_5xx}/{total_requests} requests are errors ({total_error_rate}%)",
+                likely_cause="Broken routes, client misuse, auth/session issues, or upstream service faults",
+                action="Review friction_4xx_5xx_paths.csv and prioritize top failing routes with product/backend owners",
+            )
+        )
+
+    if suspicious_count >= 20 or suspicious_rate >= 1.0:
+        sev = "HIGH" if suspicious_rate >= 5.0 else "MODERATE"
+        suspicious_examples = (
+            df[df["is_suspicious"]]["path"].value_counts().head(5).to_dict() if not df.empty else {}
+        )
+        findings.append(
+            Finding(
+                area="Security",
+                severity=sev,
+                issue="Suspicious probe traffic detected",
+                evidence=f"{suspicious_count}/{total_requests} requests match attack signatures ({suspicious_rate}%)",
+                likely_cause=f"Automated internet scanning/probing. Top patterns: {suspicious_examples or 'n/a'}",
+                action="Apply/verify WAF and rate limiting, block abusive IPs, and confirm latest OS/web stack security patches",
+            )
+        )
+
+    if bot_count >= 100 or bot_rate >= 20.0:
+        sev = "MODERATE" if bot_rate < 40.0 else "HIGH"
+        findings.append(
+            Finding(
+                area="Traffic Quality",
+                severity=sev,
+                issue="Bot-like traffic dominates a significant share of requests",
+                evidence=f"{bot_count}/{total_requests} requests are bot-like ({bot_rate}%)",
+                likely_cause="Crawler/scanner activity consuming capacity and obscuring real user behavior",
+                action="Tune bot management rules and monitor infra capacity impact during peaks",
+            )
+        )
+
+    if parse_coverage < 30.0 and total_lines > 0:
+        findings.append(
+            Finding(
+                area="Observability",
+                severity="MODERATE",
+                issue="Low parse coverage against scanned lines",
+                evidence=f"Parsed {total_requests} of {total_lines} scanned lines ({parse_coverage}%)",
+                likely_cause="Mixed log formats, unexpected custom format, or non-log files in ZIP",
+                action="Standardize logging format and include representative access/error logs for accurate scoring",
+            )
+        )
+
+    if not findings:
+        findings.append(
+            Finding(
+                area="Overall Health",
+                severity="LOW",
+                issue="No high-signal operational or security risk detected",
+                evidence=f"{total_requests} access rows parsed with manageable error/security indicators",
+                likely_cause="Normal traffic and error profile for the sampled window",
+                action="Continue routine monitoring and periodic patch maintenance",
+            )
+        )
+
+    key_metrics = {
+        "Total scanned lines": str(total_lines),
+        "Parsed access rows": str(total_requests),
+        "4xx/5xx requests": f"{total_4xx_5xx} ({total_error_rate}%)",
+        "5xx requests": f"{total_5xx} ({server_error_rate}%)",
+        "Suspicious requests": f"{suspicious_count} ({suspicious_rate}%)",
+        "Bot-like requests": f"{bot_count} ({bot_rate}%)",
+        "Unique IPs": str(df["ip"].nunique() if not df.empty else 0),
+        "Unique paths": str(df["path"].nunique() if not df.empty else 0),
+        "Parse coverage": f"{parse_coverage}%",
+    }
+    write_decision_outputs(
+        out_path=out_path,
+        system_name="Nginx",
+        zip_path=zip_path,
+        scanned_lines=total_lines,
+        parsed_entries=total_requests,
+        findings=findings,
+        key_metrics=key_metrics,
+    )
+
     report = f"""# Nginx Log Report
 
 ## Input
@@ -245,6 +522,8 @@ def analyze_nginx(zip_path: Path, out_path: Path) -> None:
 ## Key output files
 
 - `parsed_nginx_access.csv`
+- `decision.md`
+- `decision.json`
 - `status_summary.csv`
 - `top_paths.csv`
 - `top_ips.csv`
@@ -340,6 +619,24 @@ def analyze_laravel(zip_path: Path, out_path: Path) -> None:
     flush_current()
 
     if not entries:
+        write_decision_outputs(
+            out_path=out_path,
+            system_name="Laravel",
+            zip_path=zip_path,
+            scanned_lines=total_lines,
+            parsed_entries=0,
+            findings=[
+                Finding(
+                    area="Observability",
+                    severity="MODERATE",
+                    issue="No parseable Laravel log entries found",
+                    evidence="0 parsed entries from scanned files",
+                    likely_cause="Unexpected log format, missing log files, or empty ZIP",
+                    action="Validate `storage/logs` exports and timestamped Laravel format before rerun",
+                )
+            ],
+            key_metrics={"Total scanned lines": str(total_lines), "Parsed entries": "0"},
+        )
         write_markdown(
             out_path,
             "report.md",
@@ -382,6 +679,122 @@ def analyze_laravel(zip_path: Path, out_path: Path) -> None:
 
     critical_count = int(df["level"].isin(["CRITICAL", "ALERT", "EMERGENCY"]).sum())
     error_count = int(df["level"].isin(["ERROR", "CRITICAL", "ALERT", "EMERGENCY"]).sum())
+    unknown_count = int((df["level"] == "UNKNOWN").sum())
+    critical_rate = percent(critical_count, len(df))
+    error_rate = percent(error_count, len(df))
+    unknown_rate = percent(unknown_count, len(df))
+
+    findings: list[Finding] = []
+
+    if critical_count >= 5 or critical_rate >= 1.0:
+        sev = "CRITICAL" if critical_rate >= 3.0 else "HIGH"
+        top_critical_fps = (
+            df[df["level"].isin(["CRITICAL", "ALERT", "EMERGENCY"])]["fingerprint"]
+            .value_counts()
+            .head(5)
+            .to_dict()
+        )
+        findings.append(
+            Finding(
+                area="Application Stability",
+                severity=sev,
+                issue="Critical-severity Laravel events are recurring",
+                evidence=f"{critical_count}/{len(df)} entries are critical/alert/emergency ({critical_rate}%)",
+                likely_cause=f"High-impact runtime faults. Dominant critical signatures: {top_critical_fps or 'n/a'}",
+                action="Treat as incident: triage top critical fingerprints and map to failing services/deployments",
+            )
+        )
+
+    if error_count >= 50 or error_rate >= 10.0:
+        sev = "HIGH" if error_rate >= 20.0 else "MODERATE"
+        dominant = top_error_fingerprints.head(1).to_dict() if not top_error_fingerprints.empty else {}
+        findings.append(
+            Finding(
+                area="Reliability",
+                severity=sev,
+                issue="Error volume is high relative to total logged events",
+                evidence=f"{error_count}/{len(df)} entries are error+ ({error_rate}%)",
+                likely_cause=f"One or more repeated faults, likely concentrated in: {dominant or 'n/a'}",
+                action="Prioritize top_error_fingerprints.csv and create owner-mapped remediation plan",
+            )
+        )
+
+    if not top_exception_classes.empty:
+        top_exc_name, top_exc_count = next(iter(top_exception_classes.items()))
+        exception_rate = percent(int(top_exc_count), len(df))
+        if int(top_exc_count) >= 10 or exception_rate >= 5.0:
+            sev = "HIGH" if "PDO" in top_exc_name or "Query" in top_exc_name else "MODERATE"
+            findings.append(
+                Finding(
+                    area="Root Cause",
+                    severity=sev,
+                    issue=f"Exception family '{top_exc_name}' is repeatedly raised",
+                    evidence=f"{top_exc_count}/{len(df)} entries ({exception_rate}%)",
+                    likely_cause="Shared underlying defect, dependency outage, or schema/query inconsistency",
+                    action="Correlate exception stack traces with deployment/version changes and fix highest-frequency path first",
+                )
+            )
+
+    security_hints = int(
+        df["message"].str.contains(r"(cve-|vulnerab|security|deprecated|unsupported|exploit)", case=False, regex=True).sum()
+    )
+    security_hint_rate = percent(security_hints, len(df))
+    if security_hints >= 5 or security_hint_rate >= 1.0:
+        findings.append(
+            Finding(
+                area="Patch & Dependency Risk",
+                severity="HIGH" if security_hint_rate >= 3.0 else "MODERATE",
+                issue="Security or outdated dependency hints are present in logs",
+                evidence=f"{security_hints}/{len(df)} entries contain security/deprecation indicators ({security_hint_rate}%)",
+                likely_cause="Unpatched packages, unsupported runtime versions, or insecure configurations",
+                action="Audit framework/runtime/package versions and apply latest security patches with changelog review",
+            )
+        )
+
+    if unknown_count >= 20 or unknown_rate >= 5.0:
+        findings.append(
+            Finding(
+                area="Observability",
+                severity="MODERATE",
+                issue="A meaningful share of logs could not be classified",
+                evidence=f"{unknown_count}/{len(df)} entries are UNKNOWN ({unknown_rate}%)",
+                likely_cause="Multiline fragments or format deviations reducing analytic fidelity",
+                action="Normalize logging format and preserve structured metadata (request id, route, user id)",
+            )
+        )
+
+    if not findings:
+        findings.append(
+            Finding(
+                area="Overall Health",
+                severity="LOW",
+                issue="No high-signal application risk detected in sampled Laravel logs",
+                evidence=f"{len(df)} entries parsed with limited critical/error concentration",
+                likely_cause="Current log window appears operationally stable",
+                action="Continue regular monitoring, deploy checks, and routine dependency patching",
+            )
+        )
+
+    key_metrics = {
+        "Total scanned lines": str(total_lines),
+        "Parsed entries": str(len(df)),
+        "Error/Critical entries": f"{error_count} ({error_rate}%)",
+        "Critical/Alert/Emergency": f"{critical_count} ({critical_rate}%)",
+        "Unknown-level entries": f"{unknown_count} ({unknown_rate}%)",
+        "Unique fingerprints": str(df["fingerprint"].nunique()),
+        "Unique exception classes": str(df[df["exception_class"] != ""]["exception_class"].nunique()),
+        "URL hints found": str(int((df["url_hint"] != "").sum())),
+        "User hints found": str(int((df["user_hint"] != "").sum())),
+    }
+    write_decision_outputs(
+        out_path=out_path,
+        system_name="Laravel",
+        zip_path=zip_path,
+        scanned_lines=total_lines,
+        parsed_entries=len(df),
+        findings=findings,
+        key_metrics=key_metrics,
+    )
 
     report = f"""# Laravel Log Report
 
@@ -403,6 +816,8 @@ def analyze_laravel(zip_path: Path, out_path: Path) -> None:
 ## Key output files
 
 - `parsed_laravel_logs.csv`
+- `decision.md`
+- `decision.json`
 - `level_summary.csv`
 - `top_error_fingerprints.csv`
 - `top_exception_classes.csv`

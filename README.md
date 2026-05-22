@@ -99,5 +99,7 @@ output/laravel-report/
 Each report contains:
 
 - `report.md`
+- `decision.md` (executive decision summary for senior engineers)
+- `decision.json` (machine-readable risk/decision output)
 - CSV summaries
 - chart PNG files when enough data exists
